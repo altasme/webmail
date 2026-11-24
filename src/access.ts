@@ -1,0 +1,64 @@
+// Mailbox authorization. This package assumes your app's own auth layer
+// already resolved a logged-in staff user before calling anything here --
+// mailbox data is then gated per account by mail_account_access, a second,
+// explicit layer on top: a staff role alone grants nothing. Owner/admin can
+// *manage* identities and grant access (including to themselves) but do
+// not implicitly read every mailbox.
+//
+// IDOR posture: a message/thread/draft/label/attachment whose account the
+// caller can't access should be reported as 404, never 403, by your own
+// route handlers, so ids can't be probed for existence.
+
+// The only shape this package needs from your app's user/staff type. Your
+// own type (whatever it's called -- StaffUser, AppUser, ...) just needs to
+// structurally satisfy this; no import from this package is required on
+// your side.
+export interface MailUser {
+  id: string;
+  role: string;
+}
+
+export interface AccessEntry {
+  accountId: string;
+  canSend: boolean;
+  emailAddress: string;
+  displayName: string;
+}
+
+export type MailAccess = Map<string, AccessEntry>;
+
+export function isMailAdmin(user: MailUser): boolean {
+  return user.role === "owner" || user.role === "admin";
+}
+
+export async function loadAccess(db: D1Database, userId: string): Promise<MailAccess> {
+  const rows = await db
+    .prepare(
+      `SELECT a.account_id, a.can_send, m.email_address, m.display_name
+       FROM mail_account_access a JOIN mail_accounts m ON m.id = a.account_id
+       WHERE a.user_id = ? AND m.is_active = 1
+       ORDER BY m.sort_order, m.email_address`
+    )
+    .bind(userId)
+    .all<{ account_id: string; can_send: number; email_address: string; display_name: string }>();
+  const map: MailAccess = new Map();
+  for (const r of rows.results) {
+    map.set(r.account_id, { accountId: r.account_id, canSend: !!r.can_send, emailAddress: r.email_address, displayName: r.display_name });
+  }
+  return map;
+}
+
+/**
+ * Resolves the `accountId` query/body value to the set of account ids to
+ * scope a query by. "all" (or empty) = every accessible account (unified
+ * inbox). An id the caller can't access yields an empty list -- callers
+ * return empty results / 404 rather than leaking anything.
+ */
+export function scopeAccountIds(access: MailAccess, requested: string | null | undefined): string[] {
+  if (!requested || requested === "all") return [...access.keys()];
+  return access.has(requested) ? [requested] : [];
+}
+
+export function placeholders(n: number): string {
+  return Array.from({ length: n }, () => "?").join(", ");
+}
