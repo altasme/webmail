@@ -6,7 +6,7 @@ signatures, several sender identities, SMTP sending with tracked retries,
 and inbound mail through Cloudflare Email Routing. It was extracted
 unmodified (apart from genericizing two small type dependencies) from
 ClientKeeper's `/mail` build for `altasme.com` -- see this repo's own
-`docs/provisioning-runbook.md` for the exact live setup, and
+`docs/cloudflare-provisioning-runbook.md` for the exact live setup, and
 `altasme/clientkeeper`'s CLAUDE.md §32 for the original, fuller build
 write-up if you want more narrative detail than this doc repeats.
 
@@ -190,6 +190,40 @@ settings (policy + per-user preferences). ClientKeeper's
 working reference to copy the shape of -- each one is a short wrapper
 around one or two of this package's functions, in the same spirit as the
 example above.
+
+## Importing: the barrel vs. per-module subpaths
+
+Import the default barrel (`@altasme/webmail-kit`) from your Pages
+Functions routes and your standalone Worker -- that's the common case,
+and it's fine there because `cloudflare:sockets` genuinely exists in the
+Workers runtime both run on.
+
+**Don't import the barrel from plain Node code (notably: tests).** The
+barrel transitively re-exports `sendRoute.ts`, which has a real (not
+type-only) top-level `import` of `smtpTransport.ts`, which has a real
+top-level `import { connect } from "cloudflare:sockets"`. Node's own ESM
+loader rejects that scheme outright (`ERR_UNSUPPORTED_ESM_URL_SCHEME`) --
+and because ES module imports are evaluated eagerly, this happens the
+instant *anything* is imported from the barrel, even if all you actually
+wanted was `dedupeAddresses` from `address.ts`. This isn't a bug to work
+around with a try/catch; it's `cloudflare:sockets` doing exactly what
+it's supposed to do outside a Workers runtime.
+
+For Node-based testing (or any other non-Workers consumer), import the
+specific per-module subpath instead -- every module has one:
+
+```ts
+import { dedupeAddresses } from "@altasme/webmail-kit/address";
+import { dotStuff, smtpSend, SmtpError } from "@altasme/webmail-kit/smtp"; // smtp.ts itself has no cloudflare:sockets import -- only smtpTransport.ts does
+import { resolveSmtpConfig } from "@altasme/webmail-kit/config";
+```
+
+`smtp.ts` (the protocol logic) and `smtpTransport.ts` (the real
+`cloudflare:sockets` connector) are deliberately separate files for
+exactly this reason: `smtp.ts`'s `smtpSend()` takes an injected
+`SmtpConnector`, so the protocol itself is fully testable under plain
+Node against a scripted fake server -- it's only the real connector that
+needs the Workers runtime.
 
 ## What this package deliberately does NOT include
 
