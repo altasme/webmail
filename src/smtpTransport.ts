@@ -7,7 +7,7 @@
 // must accept submission on 465 (implicit TLS) or 587 (STARTTLS).
 
 import { connect } from "cloudflare:sockets";
-import { smtpSend, type SmtpConfig, type SmtpConnector, type SmtpEnvelope, type SmtpResult, type SmtpSocket } from "./smtp";
+import { smtpSend, smtpVerifyLogin, type SmtpConfig, type SmtpConnector, type SmtpEnvelope, type SmtpLoginResult, type SmtpResult, type SmtpSocket } from "./smtp";
 
 export const cloudflareSmtpConnector: SmtpConnector = ({ host, port, security }) => {
   const socket = connect(
@@ -26,3 +26,15 @@ export const cloudflareSmtpConnector: SmtpConnector = ({ host, port, security })
 export type SmtpTransport = (config: SmtpConfig, envelope: SmtpEnvelope, data: string) => Promise<SmtpResult>;
 
 export const cloudflareSmtpTransport: SmtpTransport = (config, envelope, data) => smtpSend(cloudflareSmtpConnector, config, envelope, data);
+
+/**
+ * Real-network credential check: does `username`/`password` log in to the
+ * SMTP server in `config`? Only the config's host/port/security/EHLO name
+ * are used -- its own username/password are ignored. Sends no message.
+ * See smtpVerifyLogin() in smtp.ts for the exact contract; the protocol
+ * logic is unit-testable there against a fake connector, this binding to
+ * `cloudflare:sockets` is not (it only exists in the Workers runtime).
+ */
+export function verifySmtpLogin(config: SmtpConfig, username: string, password: string): Promise<SmtpLoginResult> {
+  return smtpVerifyLogin(cloudflareSmtpConnector, config, username, password);
+}

@@ -11,7 +11,12 @@ export async function loadMessageDetails(
   db: D1Database,
   accountIds: string[],
   sel: { messageIds?: string[]; threadId?: string; folders?: string[] | null },
-  requestRemoteImages: boolean
+  requestRemoteImages: boolean,
+  // Where cid: inline images are served from. Defaults to ClientKeeper's
+  // staff route; a second, separately-authenticated route tree (e.g. a
+  // mailbox owner's own view) passes its own prefix so the image URL hits
+  // a route that session can actually use.
+  attachmentBasePath = "/api/app/mail/attachments"
 ) {
   if (!accountIds.length) return [];
   let rows: (MessageRow & { body_html: string; body_text: string })[];
@@ -54,7 +59,7 @@ export async function loadMessageDetails(
     const atts = attachments.get(row.id) ?? [];
     const cidMap = new Map<string, string>();
     for (const a of atts) {
-      if (a.content_id && a.storage_status === "stored") cidMap.set(a.content_id.replace(/[<>]/g, "").toLowerCase(), `/api/app/mail/attachments/${a.id}/preview`);
+      if (a.content_id && a.storage_status === "stored") cidMap.set(a.content_id.replace(/[<>]/g, "").toLowerCase(), `${attachmentBasePath}/${a.id}/preview`);
     }
     const sanitized = await sanitizeEmailHtml(row.body_html, { allowRemoteImages: allowRemote, cidMap });
     const usedCids = new Set([...cidMap.keys()].filter((cid) => row.body_html.toLowerCase().includes(`cid:${cid}`)));

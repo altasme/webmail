@@ -191,6 +191,46 @@ working reference to copy the shape of -- each one is a short wrapper
 around one or two of this package's functions, in the same spirit as the
 example above.
 
+## Mailbox owners (a second kind of principal)
+
+Some apps also let the owner of ONE mailbox (not a staff user) sign in to
+just that mailbox. ClientKeeper does this for client-hosted mailboxes (its
+CLAUDE.md §36). The package supports it with three additive pieces; the
+app owns the session, the eligibility rule and the routes:
+
+- **`smtpVerifyLogin(connector, config, username, password)`** (`smtp.ts`)
+  and its `cloudflare:sockets` binding **`verifySmtpLogin(config, username,
+  password)`** (`smtpTransport.ts`): connect, EHLO, STARTTLS if configured,
+  AUTH with the *supplied* credentials, QUIT. Sends nothing. The config's
+  own username/password are ignored. Returns `{ ok: true }` or
+  `{ ok: false, reason: "auth_failed" | "connection_failed" | "timeout" }`,
+  never throws, never puts the password in anything it returns. An empty
+  username/password is refused before connecting (the shared handshake
+  skips AUTH when there's no username, so an empty login would otherwise
+  "succeed"). It shares one handshake implementation (`SmtpSession` in
+  `smtp.ts`) with `smtpSend()`, so the login check and real sending can't
+  drift apart.
+- **`queueOutboundMessageAsMailboxOwner(env, accountId, access, input)`**
+  (`send.ts`): the normal send pipeline with `created_by = NULL` (the
+  column `REFERENCES users(id)`, and a mailbox owner has no `users` row),
+  the idempotency key and hourly limit scoped to that mailbox, the From
+  identity forced to `accountId`, and drafts refused.
+- **`loadMessageDetails(..., attachmentBasePath)`** (`detail.ts`): the
+  `cid:` inline-image URL prefix, defaulting to `/api/app/mail/attachments`,
+  so a second route tree can point images at routes its own session can use.
+
+Do NOT reuse `mailHandler()` for mailbox owners: it reads
+`ctx.data.staffUser` and resolves access from `mail_account_access` by
+`users.id`. Build a separate guard that resolves the owner's one mailbox
+from its own session and passes a one-entry `MailAccess` map; every query,
+detail and action function here scopes by that map.
+
+**Drafts don't work for mailbox owners with this schema:**
+`mail_drafts.created_by` is `NOT NULL REFERENCES users(id)`, and D1
+enforces foreign keys. Attachment upload depends on drafts, so it doesn't
+either. Supporting them needs a schema change (e.g. a nullable
+`created_by` plus an owner-account column), not a code change here.
+
 ## Importing: the barrel vs. per-module subpaths
 
 Import the default barrel (`@altasme/webmail-kit`) from your Pages
