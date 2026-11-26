@@ -67,6 +67,11 @@ export class SmtpError extends Error {
   }
 }
 
+// Distinguishable from other read failures so smtpVerifyLogin() can report
+// a timeout as such. Same message text as before, so smtpSend()'s error
+// wording is unchanged.
+class SmtpTimeoutError extends Error {}
+
 interface Reply {
   code: number;
   lines: string[];
@@ -90,7 +95,7 @@ class LineReader {
       if (this.buffer.length > 64 * 1024) throw new Error("Reply line too long");
       let timer: ReturnType<typeof setTimeout> | null = null;
       const timeout = new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error("Timed out waiting for server")), timeoutMs);
+        timer = setTimeout(() => reject(new SmtpTimeoutError("Timed out waiting for server")), timeoutMs);
       });
       try {
         const { value, done } = await Promise.race([this.reader.read(), timeout]);
@@ -130,45 +135,43 @@ function isLocalHost(host: string): boolean {
 function assertSafeCommandArg(value: string) {
   if (/[\r\n<>]/.test(value)) throw new SmtpError("Invalid address in SMTP envelope", { kind: "permanent", stage: "envelope" });
 }
+// One SMTP connection: reply parsing, command/expect helpers, and the
+// shared opening handshake (greeting, EHLO, STARTTLS, AUTH) used by both
+// smtpSend() and smtpVerifyLogin(). One implementation, so the login check
+// and real sending can never disagree about how a server is spoken to.
+class SmtpSession {
+  stage = "connect";
+  private socket?: SmtpSocket;
+  private reader?: LineReader;
+  private writer?: WritableStreamDefaultWriter<Uint8Array>;
+  private readonly encoder = new TextEncoder();
 
-/**
- * Sends one message over one SMTP session. `data` is the full RFC 5322
- * message (headers + body, CRLF line endings, NOT yet dot-stuffed).
- */
-export async function smtpSend(connector: SmtpConnector, config: SmtpConfig, envelope: SmtpEnvelope, data: string): Promise<SmtpResult> {
-  if (config.security === "none" && !isLocalHost(config.host)) {
-    // Plaintext SMTP with credentials over the public internet would leak
-    // the password; only allowed against a local test server.
-    throw new SmtpError("Refusing unencrypted SMTP to a non-local host", { kind: "permanent", stage: "config" });
+  constructor(private readonly timeoutMs: number) {}
+
+  private attach(s: SmtpSocket) {
+    this.socket = s;
+    this.reader = new LineReader(s.readable);
+    this.writer = s.writable.getWriter();
   }
-  if (!envelope.recipients.length) throw new SmtpError("No recipients", { kind: "permanent", stage: "envelope" });
-  assertSafeCommandArg(envelope.from);
-  envelope.recipients.forEach(assertSafeCommandArg);
 
-  const timeoutMs = config.timeoutMs ?? 30_000;
-  const encoder = new TextEncoder();
-  let stage = "connect";
-  let dataTerminatorSent = false;
-  // Held in an object (not bare `let`s) so TypeScript doesn't narrow them
-  // to `null` across the closures below.
-  const conn: { socket?: SmtpSocket; reader?: LineReader; writer?: WritableStreamDefaultWriter<Uint8Array> } = {};
-
-  const readReply = async (): Promise<Reply> => {
+  async readReply(): Promise<Reply> {
     const lines: string[] = [];
     while (true) {
-      const line = await conn.reader!.readLine(timeoutMs);
+      const line = await this.reader!.readLine(this.timeoutMs);
       const m = line.match(/^(\d{3})([ -])(.*)$/);
       if (!m) throw new Error(`Malformed server reply`);
       lines.push(m[3]!);
       if (m[2] === " ") return { code: Number(m[1]), lines };
       if (lines.length > 200) throw new Error("Reply too long");
     }
-  };
-  const write = async (s: string) => {
-    await conn.writer!.write(encoder.encode(s));
-  };
-  const expect = async (accept: number[], label: string, redact = false): Promise<Reply> => {
-    const reply = await readReply();
+  }
+
+  async write(s: string) {
+    await this.writer!.write(this.encoder.encode(s));
+  }
+
+  async expect(accept: number[], label: string, redact = false): Promise<Reply> {
+    const reply = await this.readReply();
     if (!accept.includes(reply.code)) {
       const text = redact ? "" : ` ${reply.lines.join(" ").slice(0, 200)}`;
       throw new SmtpError(`${label} rejected: ${reply.code}${text}`, {
@@ -178,104 +181,180 @@ export async function smtpSend(connector: SmtpConnector, config: SmtpConfig, env
       });
     }
     return reply;
-  };
-  const command = async (cmd: string, accept: number[], label: string, redact = false) => {
-    stage = label;
-    await write(`${cmd}\r\n`);
-    return expect(accept, label, redact);
-  };
-  const attach = (s: SmtpSocket) => {
-    conn.socket = s;
-    conn.reader = new LineReader(s.readable);
-    conn.writer = s.writable.getWriter();
-  };
+  }
 
-  try {
-    attach(await connector({ host: config.host, port: config.port, security: config.security }));
-    stage = "greeting";
-    await expect([220], "greeting");
+  async command(cmd: string, accept: number[], label: string, redact = false): Promise<Reply> {
+    this.stage = label;
+    await this.write(`${cmd}\r\n`);
+    return this.expect(accept, label, redact);
+  }
+
+  /**
+   * Connects and runs the opening handshake: greeting, EHLO, STARTTLS (when
+   * configured), then AUTH with `config.username`/`config.password` if a
+   * username is set. Returns the (post-TLS) EHLO reply. The AUTH exchange
+   * is always redacted from thrown errors.
+   */
+  async open(connector: SmtpConnector, config: SmtpConfig): Promise<Reply> {
+    this.attach(await connector({ host: config.host, port: config.port, security: config.security }));
+    this.stage = "greeting";
+    await this.expect([220], "greeting");
     const ehloName = (config.clientName || "localhost").replace(/[^A-Za-z0-9.-]/g, "") || "localhost";
-    let ehlo = await command(`EHLO ${ehloName}`, [250], "EHLO");
+    let ehlo = await this.command(`EHLO ${ehloName}`, [250], "EHLO");
 
     if (config.security === "starttls") {
       if (!ehlo.lines.some((l) => /^STARTTLS\b/i.test(l))) {
         throw new SmtpError("Server does not offer STARTTLS", { kind: "permanent", stage: "STARTTLS" });
       }
-      await command("STARTTLS", [220], "STARTTLS");
-      if (!conn.socket!.startTls) throw new SmtpError("TLS upgrade not supported by transport", { kind: "permanent", stage: "STARTTLS" });
-      conn.reader!.release();
-      conn.writer!.releaseLock();
-      attach(conn.socket!.startTls());
-      ehlo = await command(`EHLO ${ehloName}`, [250], "EHLO");
+      await this.command("STARTTLS", [220], "STARTTLS");
+      if (!this.socket!.startTls) throw new SmtpError("TLS upgrade not supported by transport", { kind: "permanent", stage: "STARTTLS" });
+      this.reader!.release();
+      this.writer!.releaseLock();
+      this.attach(this.socket!.startTls());
+      ehlo = await this.command(`EHLO ${ehloName}`, [250], "EHLO");
     }
 
     const authLine = ehlo.lines.find((l) => /^AUTH[ =]/i.test(l)) ?? "";
     const mechanisms = authLine.toUpperCase().split(/[ =]+/).slice(1);
     if (config.username) {
-      stage = "AUTH";
+      this.stage = "AUTH";
       if (mechanisms.includes("PLAIN") || !mechanisms.includes("LOGIN")) {
-        await command(`AUTH PLAIN ${b64(`\u0000${config.username}\u0000${config.password}`)}`, [235], "AUTH", true);
+        await this.command(`AUTH PLAIN ${b64(`\u0000${config.username}\u0000${config.password}`)}`, [235], "AUTH", true);
       } else {
-        await command("AUTH LOGIN", [334], "AUTH", true);
-        await command(b64(config.username), [334], "AUTH", true);
-        await command(b64(config.password), [235], "AUTH", true);
+        await this.command("AUTH LOGIN", [334], "AUTH", true);
+        await this.command(b64(config.username), [334], "AUTH", true);
+        await this.command(b64(config.password), [235], "AUTH", true);
       }
     }
+    return ehlo;
+  }
+
+  /** Best-effort polite QUIT; never throws. */
+  async quit(waitForReply: boolean) {
+    try {
+      if (!this.writer) return;
+      await this.write("QUIT\r\n");
+      if (waitForReply) await this.readReply();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  async close() {
+    try {
+      this.reader?.release();
+      this.writer?.releaseLock();
+    } catch {
+      /* ignore */
+    }
+    try {
+      await this.socket?.close();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function assertSafeTransport(config: SmtpConfig) {
+  if (config.security === "none" && !isLocalHost(config.host)) {
+    // Plaintext SMTP with credentials over the public internet would leak
+    // the password; only allowed against a local test server.
+    throw new SmtpError("Refusing unencrypted SMTP to a non-local host", { kind: "permanent", stage: "config" });
+  }
+}
+
+/**
+ * Sends one message over one SMTP session. `data` is the full RFC 5322
+ * message (headers + body, CRLF line endings, NOT yet dot-stuffed).
+ */
+export async function smtpSend(connector: SmtpConnector, config: SmtpConfig, envelope: SmtpEnvelope, data: string): Promise<SmtpResult> {
+  assertSafeTransport(config);
+  if (!envelope.recipients.length) throw new SmtpError("No recipients", { kind: "permanent", stage: "envelope" });
+  assertSafeCommandArg(envelope.from);
+  envelope.recipients.forEach(assertSafeCommandArg);
+
+  const encoder = new TextEncoder();
+  const session = new SmtpSession(config.timeoutMs ?? 30_000);
+  let dataTerminatorSent = false;
+
+  try {
+    const ehlo = await session.open(connector, config);
 
     const sizeSupported = ehlo.lines.some((l) => /^SIZE\b/i.test(l));
     const payload = dotStuff(data);
     const byteLength = encoder.encode(payload).length;
-    await command(`MAIL FROM:<${envelope.from}>${sizeSupported ? ` SIZE=${byteLength}` : ""}`, [250], "MAIL FROM");
+    await session.command(`MAIL FROM:<${envelope.from}>${sizeSupported ? ` SIZE=${byteLength}` : ""}`, [250], "MAIL FROM");
     for (const rcpt of envelope.recipients) {
-      await command(`RCPT TO:<${rcpt}>`, [250, 251], "RCPT TO");
+      await session.command(`RCPT TO:<${rcpt}>`, [250, 251], "RCPT TO");
     }
-    await command("DATA", [354], "DATA");
-    stage = "message body";
+    await session.command("DATA", [354], "DATA");
+    session.stage = "message body";
     // Write in chunks so a large attachment doesn't build one giant buffer.
     const CHUNK = 64 * 1024;
-    for (let i = 0; i < payload.length; i += CHUNK) await write(payload.slice(i, i + CHUNK));
-    await write(".\r\n");
+    for (let i = 0; i < payload.length; i += CHUNK) await session.write(payload.slice(i, i + CHUNK));
+    await session.write(".\r\n");
     dataTerminatorSent = true;
-    stage = "end of data";
-    const final = await expect([250], "end of data");
-    try {
-      await write("QUIT\r\n");
-      await readReply();
-    } catch {
-      /* the message is already accepted; a failed QUIT changes nothing */
-    }
+    session.stage = "end of data";
+    const final = await session.expect([250], "end of data");
+    // The message is already accepted; a failed QUIT changes nothing.
+    await session.quit(true);
     return { code: final.code, response: final.lines.join(" ").slice(0, 300) };
   } catch (err) {
     if (err instanceof SmtpError) {
       // Politely abort the transaction where possible.
-      if (err.kind !== "unknown") {
-        try {
-          if (conn.writer) await conn.writer.write(encoder.encode("QUIT\r\n"));
-        } catch {
-          /* ignore */
-        }
-      }
+      if (err.kind !== "unknown") await session.quit(false);
       throw err;
     }
     const message = err instanceof Error ? err.message : "SMTP failure";
     if (dataTerminatorSent) {
       throw new SmtpError(`Connection problem after the message was handed to the server (${message}); it may or may not have been accepted`, {
         kind: "unknown",
-        stage,
+        stage: session.stage,
       });
     }
-    throw new SmtpError(`Network error during ${stage}: ${message}`, { kind: "transient", stage });
+    throw new SmtpError(`Network error during ${session.stage}: ${message}`, { kind: "transient", stage: session.stage });
   } finally {
-    try {
-      conn.reader?.release();
-      conn.writer?.releaseLock();
-    } catch {
-      /* ignore */
+    await session.close();
+  }
+}
+
+export type SmtpLoginResult = { ok: true } | { ok: false; reason: "auth_failed" | "connection_failed" | "timeout" };
+
+/**
+ * Checks whether `username`/`password` is a valid login on the SMTP server
+ * described by `config`, WITHOUT sending anything: connect, EHLO, STARTTLS
+ * (if configured), AUTH with the CALLER-SUPPLIED credentials, then QUIT.
+ * `config.username`/`config.password` (the identity's own outbound login)
+ * are deliberately ignored -- this exists to test a different credential,
+ * e.g. a mailbox owner proving they know their own real password.
+ *
+ * Never throws, and never puts the password (or any AUTH payload) in
+ * anything it returns. An empty username or password is refused up front
+ * as `auth_failed`: the shared handshake skips AUTH entirely when there is
+ * no username, so without this guard an empty login would "succeed"
+ * against any server. A server that answers AUTH with anything other than
+ * 235 is a failure; there is no path to `ok: true` that skips AUTH.
+ */
+export async function smtpVerifyLogin(connector: SmtpConnector, config: SmtpConfig, username: string, password: string): Promise<SmtpLoginResult> {
+  if (!username || !password || /[\r\n\u0000]/.test(username) || /[\r\n\u0000]/.test(password)) return { ok: false, reason: "auth_failed" };
+  const loginConfig: SmtpConfig = { ...config, username, password, timeoutMs: config.timeoutMs ?? 15_000 };
+  const session = new SmtpSession(loginConfig.timeoutMs!);
+  try {
+    assertSafeTransport(loginConfig);
+    await session.open(connector, loginConfig);
+    await session.quit(true);
+    return { ok: true };
+  } catch (err) {
+    if (err instanceof SmtpError) {
+      await session.quit(false);
+      // A 5xx reply to AUTH is the server saying "wrong credentials" (535)
+      // or "no such mechanism" -- either way, not logged in.
+      if (err.stage === "AUTH" && err.code !== null && err.code >= 500) return { ok: false, reason: "auth_failed" };
+      return { ok: false, reason: "connection_failed" };
     }
-    try {
-      await conn.socket?.close();
-    } catch {
-      /* ignore */
-    }
+    if (err instanceof SmtpTimeoutError) return { ok: false, reason: "timeout" };
+    return { ok: false, reason: "connection_failed" };
+  } finally {
+    await session.close();
   }
 }

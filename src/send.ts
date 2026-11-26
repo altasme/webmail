@@ -99,22 +99,59 @@ export function parseComposeBody(body: Record<string, unknown>, mode: ComposeMod
 }
 
 async function findJobByKey(db: D1Database, key: string) {
-  return db.prepare(`SELECT j.id, j.message_id, j.created_by, m.thread_id FROM mail_send_jobs j JOIN mail_messages m ON m.id = j.message_id WHERE j.idempotency_key = ?`).bind(key).first<{
+  return db.prepare(`SELECT j.id, j.message_id, j.account_id, j.created_by, m.thread_id FROM mail_send_jobs j JOIN mail_messages m ON m.id = j.message_id WHERE j.idempotency_key = ?`).bind(key).first<{
     id: string;
     message_id: string;
+    account_id: string;
     created_by: string | null;
     thread_id: string;
   }>();
 }
 
+// Who is queueing a send.
+//  - staff: a `users` row. Recorded in created_by, and is the scope for
+//    idempotency-key ownership and the per-hour send limit.
+//  - mailbox_owner: someone signed in to ONE mailbox with that mailbox's
+//    own password (no `users` row). created_by REFERENCES users(id), so it
+//    is stored as NULL and the mailbox itself is the scope instead. Drafts
+//    are not available to this actor (mail_drafts.created_by is NOT NULL
+//    REFERENCES users(id)), so a draftId is refused.
+type SendActor = { kind: "staff"; userId: string } | { kind: "mailbox_owner"; accountId: string };
+
+function ownsJob(actor: SendActor, job: { created_by: string | null; account_id: string }): boolean {
+  if (actor.kind === "staff") return job.created_by === actor.userId;
+  return job.created_by === null && job.account_id === actor.accountId;
+}
+
 export async function queueOutboundMessage(env: MailEnv, userId: string, access: MailAccess, input: ComposeInput): Promise<QueueResult> {
+  return queueOutbound(env, { kind: "staff", userId }, access, input);
+}
+
+/**
+ * Same pipeline as queueOutboundMessage(), for a mailbox owner (not a
+ * staff user): the message and job are recorded with created_by = NULL,
+ * the idempotency key and the hourly send limit are scoped to this one
+ * mailbox, the From identity must be exactly `accountId`, and drafts are
+ * refused. `access` should hold only that mailbox.
+ */
+export async function queueOutboundMessageAsMailboxOwner(env: MailEnv, accountId: string, access: MailAccess, input: ComposeInput): Promise<QueueResult> {
+  return queueOutbound(env, { kind: "mailbox_owner", accountId }, access, input);
+}
+
+async function queueOutbound(env: MailEnv, actor: SendActor, access: MailAccess, input: ComposeInput): Promise<QueueResult> {
   const db = env.DB!;
+  const createdBy = actor.kind === "staff" ? actor.userId : null;
+  const actorId = actor.kind === "staff" ? actor.userId : `mailbox:${actor.accountId}`;
   const existing = await findJobByKey(db, input.idempotencyKey);
   if (existing) {
-    if (existing.created_by !== userId) return { ok: false, status: 409, error: "idempotencyKey already used." };
+    if (!ownsJob(actor, existing)) return { ok: false, status: 409, error: "idempotencyKey already used." };
     return { ok: true, jobId: existing.id, messageId: existing.message_id, threadId: existing.thread_id, existing: true };
   }
 
+  if (actor.kind === "mailbox_owner") {
+    if (input.accountId !== actor.accountId) return { ok: false, status: 404, error: "Mailbox not found." };
+    if (input.draftId) return { ok: false, status: 404, error: "Draft not found." };
+  }
   const entry = access.get(input.accountId);
   if (!entry) return { ok: false, status: 404, error: "Mailbox not found." };
   if (!entry.canSend) return { ok: false, status: 403, error: "You have read-only access to this mailbox." };
@@ -134,7 +171,10 @@ export async function queueOutboundMessage(env: MailEnv, userId: string, access:
   if (total > policy.maxRecipients) return { ok: false, status: 400, error: `A message can have at most ${policy.maxRecipients} recipients.` };
 
   const hourAgo = new Date(Date.now() - 3600_000).toISOString();
-  const sentLastHour = await db.prepare(`SELECT COUNT(*) AS n FROM mail_send_jobs WHERE created_by = ? AND created_at > ?`).bind(userId, hourAgo).first<{ n: number }>();
+  const sentLastHour =
+    actor.kind === "staff"
+      ? await db.prepare(`SELECT COUNT(*) AS n FROM mail_send_jobs WHERE created_by = ? AND created_at > ?`).bind(actor.userId, hourAgo).first<{ n: number }>()
+      : await db.prepare(`SELECT COUNT(*) AS n FROM mail_send_jobs WHERE created_by IS NULL AND account_id = ? AND created_at > ?`).bind(actor.accountId, hourAgo).first<{ n: number }>();
   if ((sentLastHour?.n ?? 0) >= policy.sendsPerHourPerUser) {
     return { ok: false, status: 429, error: `Send limit reached (${policy.sendsPerHourPerUser} messages per hour). Try again later.` };
   }
@@ -163,7 +203,7 @@ export async function queueOutboundMessage(env: MailEnv, userId: string, access:
   let attachmentRows: { id: string; size_bytes: number; filename: string }[] = [];
   if (input.draftId) {
     const draft = await db.prepare(`SELECT id, account_id, created_by FROM mail_drafts WHERE id = ?`).bind(input.draftId).first<{ id: string; account_id: string; created_by: string }>();
-    if (!draft || draft.created_by !== userId || !access.has(draft.account_id)) return { ok: false, status: 404, error: "Draft not found." };
+    if (!draft || draft.created_by !== createdBy || !access.has(draft.account_id)) return { ok: false, status: 404, error: "Draft not found." };
     const atts = await db.prepare(`SELECT id, size_bytes, filename, storage_status FROM mail_attachments WHERE draft_id = ?`).bind(input.draftId).all<{
       id: string;
       size_bytes: number;
@@ -209,7 +249,7 @@ export async function queueOutboundMessage(env: MailEnv, userId: string, access:
     authResults: null,
     receivedAt: null,
     sentAt: null,
-    createdBy: userId,
+    createdBy,
     recipients: [
       ...to.map((address) => ({ type: "to" as const, address })),
       ...cc.map((address) => ({ type: "cc" as const, address })),
@@ -223,7 +263,7 @@ export async function queueOutboundMessage(env: MailEnv, userId: string, access:
         `INSERT INTO mail_send_jobs (id, message_id, account_id, idempotency_key, status, attempts, max_attempts, created_by, created_at, updated_at)
          VALUES (?, ?, ?, ?, 'queued', 0, 5, ?, ?, ?)`
       )
-      .bind(jobId, messageId, account.id, input.idempotencyKey, userId, now, now)
+      .bind(jobId, messageId, account.id, input.idempotencyKey, createdBy, now, now)
   );
   if (input.draftId) {
     statements.push(db.prepare(`UPDATE mail_attachments SET message_id = ?, draft_id = NULL WHERE draft_id = ?`).bind(messageId, input.draftId));
@@ -235,7 +275,7 @@ export async function queueOutboundMessage(env: MailEnv, userId: string, access:
       messageId,
       type: "send_queued",
       data: { mode: input.mode, recipients: total, attachments: attachmentRows.length },
-      actorId: userId,
+      actorId,
     })
   );
 
@@ -244,7 +284,7 @@ export async function queueOutboundMessage(env: MailEnv, userId: string, access:
   } catch (err) {
     // Lost a race on the same idempotency key: return the winner's job.
     const raced = await findJobByKey(db, input.idempotencyKey);
-    if (raced && raced.created_by === userId) return { ok: true, jobId: raced.id, messageId: raced.message_id, threadId: raced.thread_id, existing: true };
+    if (raced && ownsJob(actor, raced)) return { ok: true, jobId: raced.id, messageId: raced.message_id, threadId: raced.thread_id, existing: true };
     throw err;
   }
 
